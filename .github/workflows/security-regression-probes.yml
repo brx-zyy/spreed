@@ -1,0 +1,35 @@
+name: Security regression probes
+
+on:
+  push:
+    branches:
+      - "security-ci/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bot-signature-scope:
+    name: Bot signature room-binding probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
+
+      - name: Validate Composer manifest
+        run: composer validate --no-check-publish
+
+      - name: Lint PHP source
+        run: composer run lint
+
+      - name: Run bot signature scope probe
+        run: php tests/security/bot_signature_scope_probe.php
