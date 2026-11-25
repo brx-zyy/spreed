@@ -12,71 +12,82 @@ permissions:
 jobs:
   two-room-replay:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - name: Check out Talk source
         uses: actions/checkout@v4
+        with:
+          path: talk
 
-      - name: Start MariaDB
+      - name: Check out Nextcloud Server 36 development source
+        uses: actions/checkout@v4
+        with:
+          repository: nextcloud/server
+          ref: master
+          submodules: true
+          path: nextcloud-server
+          persist-credentials: false
+
+      - name: Set up PHP for Nextcloud Server
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: bz2, ctype, curl, dom, fileinfo, gd, iconv, intl, mbstring, openssl, pcntl, posix, redis, session, simplexml, xmlreader, xmlwriter, zip, zlib, sqlite, pdo_sqlite
+          coverage: none
+          ini-file: development
+
+      - name: Verify server branch and install isolated Nextcloud
+        working-directory: nextcloud-server
         run: |
-          docker network create nc-test
-          docker run -d --name nc-db --network nc-test \
-            -e MARIADB_ROOT_PASSWORD=rootpass \
-            -e MARIADB_DATABASE=nextcloud \
-            -e MARIADB_USER=nextcloud \
-            -e MARIADB_PASSWORD=nextcloud \
-            mariadb:11.4
+          set -euo pipefail
+          echo "Server source commit: $(git rev-parse HEAD)"
+          grep -E "OC_VersionString|OC_Version =" version.php
+          mkdir -p data
+          php occ maintenance:install --verbose \
+            --database=sqlite --database-name=nextcloud \
+            --database-host=127.0.0.1 --database-user=root --database-pass=rootpassword \
+            --admin-user admin --admin-pass admin
+
+      - name: Install this Talk checkout
+        working-directory: nextcloud-server
+        run: |
+          set -euo pipefail
+          mkdir -p apps/spreed
+          cp -a "$GITHUB_WORKSPACE/talk/." apps/spreed/
+          php occ app:enable spreed
+
+      - name: Start isolated Nextcloud HTTP server
+        working-directory: nextcloud-server
+        run: |
+          set -euo pipefail
+          php -S 127.0.0.1:8080 > /tmp/nextcloud-http.log 2>&1 &
+          echo $! > /tmp/nextcloud-http.pid
           for i in $(seq 1 90); do
-            if docker exec nc-db healthcheck.sh --connect --innodb_initialized >/dev/null 2>&1; then
+            if curl -fsS http://127.0.0.1:8080/status.php >/dev/null; then
               break
             fi
             sleep 2
           done
-          docker exec nc-db healthcheck.sh --connect --innodb_initialized
-
-      - name: Start isolated Nextcloud 36 instance
-        run: |
-          docker run -d --name nextcloud --network nc-test -p 8080:80 \
-            -e MYSQL_HOST=nc-db \
-            -e MYSQL_DATABASE=nextcloud \
-            -e MYSQL_USER=nextcloud \
-            -e MYSQL_PASSWORD=nextcloud \
-            -e NEXTCLOUD_ADMIN_USER=admin \
-            -e NEXTCLOUD_ADMIN_PASSWORD=adminpass \
-            -e NEXTCLOUD_TRUSTED_DOMAINS=localhost \
-            nextcloud:36-apache
-          for i in $(seq 1 180); do
-            if curl -fsS http://127.0.0.1:8080/status.php >/dev/null; then
-              break
-            fi
-            sleep 3
-          done
           curl -fsS http://127.0.0.1:8080/status.php
 
-      - name: Install this Talk checkout into Nextcloud
-        run: |
-          docker exec nextcloud mkdir -p /var/www/html/custom_apps/spreed
-          docker cp "$GITHUB_WORKSPACE/." nextcloud:/var/www/html/custom_apps/spreed/
-          docker exec -u root nextcloud chown -R www-data:www-data /var/www/html/custom_apps/spreed
-          docker exec -u www-data nextcloud php occ app:enable spreed
-
       - name: Configure one bot in two independent rooms and replay its signed request
+        working-directory: nextcloud-server
         shell: bash
         run: |
           set -euo pipefail
-          occ() { docker exec -u www-data nextcloud php occ "$@"; }
+          occ() { php occ "$@"; }
 
           ROOM_A_OUTPUT="$(occ talk:room:create ReplayRoomA --owner=admin)"
           ROOM_B_OUTPUT="$(occ talk:room:create ReplayRoomB --owner=admin)"
-          TOKEN_A="$(printf '%s\n' "$ROOM_A_OUTPUT" | awk '/Room token:/ {print $3}')"
-          TOKEN_B="$(printf '%s\n' "$ROOM_B_OUTPUT" | awk '/Room token:/ {print $3}')"
+          TOKEN_A="$(printf '%s\\n' "$ROOM_A_OUTPUT" | awk '/Room token:/ {print $3}')"
+          TOKEN_B="$(printf '%s\\n' "$ROOM_B_OUTPUT" | awk '/Room token:/ {print $3}')"
           test -n "$TOKEN_A"
           test -n "$TOKEN_B"
           test "$TOKEN_A" != "$TOKEN_B"
 
           SECRET="$(openssl rand -hex 32)"
           BOT_OUTPUT="$(occ talk:bot:install ReplayBot "$SECRET" https://bot.example.invalid/webhook --feature=response)"
-          BOT_ID="$(printf '%s\n' "$BOT_OUTPUT" | awk '/^ID:/ {print $2}')"
+          BOT_ID="$(printf '%s\\n' "$BOT_OUTPUT" | awk '/^ID:/ {print $2}')"
           test -n "$BOT_ID"
           occ talk:bot:setup "$BOT_ID" "$TOKEN_A" "$TOKEN_B"
 
@@ -87,7 +98,7 @@ jobs:
 
           send_signed_message() {
             local token="$1"
-            curl --silent --show-error --output /tmp/response-"$token".json \
+            curl --silent --show-error --output "/tmp/response-${token}.json" \
               --write-out '%{http_code}' \
               --request POST "$BASE_URL/$token/message" \
               --header 'OCS-APIRequest: true' \
@@ -100,10 +111,9 @@ jobs:
           echo "Original signed request to room A: HTTP $STATUS_A"
           test "$STATUS_A" = "201"
 
-          # Replay the exact same random value, message and HMAC against room B.
           STATUS_B="$(send_signed_message "$TOKEN_B")"
           echo "Replayed identical signed request to room B: HTTP $STATUS_B"
-          cat /tmp/response-"$TOKEN_B".json
+          cat "/tmp/response-${TOKEN_B}.json"
           test "$STATUS_B" = "201"
 
           echo "CONFIRMED: the exact same bot HMAC was accepted by both room endpoints."
@@ -113,6 +123,7 @@ jobs:
 
       - name: Dump server logs on failure
         if: failure()
+        working-directory: nextcloud-server
         run: |
-          docker logs nextcloud || true
-          docker logs nc-db || true
+          cat /tmp/nextcloud-http.log || true
+          tail -200 data/nextcloud.log || true
