@@ -1,0 +1,1 @@
+This directory contains focused, source-level security regression probes. A passing probe documents the behavior it detects; it is not a substitute for a live Nextcloud/Talk integration test.
